@@ -3,105 +3,172 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 
-def run(is_training=True, render=False):
 
-    env = gym.make('CartPole-v1', render_mode='human' if render else None)
+class CartPoleQLearning:
 
-    # Divide position, velocity, pole angle, and pole angular velocity into segments
-    pos_space = np.linspace(-2.4, 2.4, 10)
-    vel_space = np.linspace(-4, 4, 10)
-    ang_space = np.linspace(-.2095, .2095, 10)
-    ang_vel_space = np.linspace(-4, 4, 10)
+    def __init__(self, render=False):
+        self.env = gym.make(
+            "CartPole-v1",
+            render_mode="human" if render else None
+        )
 
-    if(is_training):
-        q = np.zeros((len(pos_space)+1, len(vel_space)+1, len(ang_space)+1, len(ang_vel_space)+1, env.action_space.n)) # init a 11x11x11x11x2 array
-    else:
-        f = open('cartpole.pkl', 'rb')
-        q = pickle.load(f)
-        f.close()
+        # Discretization bins
+        self.pos_bins = np.linspace(-2.4, 2.4, 10)
+        self.vel_bins = np.linspace(-4, 4, 10)
+        self.angle_bins = np.linspace(-0.2095, 0.2095, 10)
+        self.ang_vel_bins = np.linspace(-4, 4, 10)
 
-    learning_rate_a = 0.1 # alpha or learning rate
-    discount_factor_g = 0.99 # gamma or discount factor.
+        # Q-table
+        self.q_table = np.zeros((
+            len(self.pos_bins) + 1,
+            len(self.vel_bins) + 1,
+            len(self.angle_bins) + 1,
+            len(self.ang_vel_bins) + 1,
+            self.env.action_space.n
+        ))
 
-    epsilon = 1         # 1 = 100% random actions
-    epsilon_decay_rate = 0.00001 # epsilon decay rate
-    rng = np.random.default_rng()   # random number generator
+        # Hyperparameters
+        self.alpha = 0.1
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.00001
 
-    rewards_per_episode = []
+        self.rng = np.random.default_rng()
 
-    i = 0
+    # =========================
+    # State Discretization
+    # =========================
+    def _discretize(self, state):
+        return (
+            np.digitize(state[0], self.pos_bins),
+            np.digitize(state[1], self.vel_bins),
+            np.digitize(state[2], self.angle_bins),
+            np.digitize(state[3], self.ang_vel_bins)
+        )
 
-    # for i in range(episodes):
-    while(True):
+    # =========================
+    # Training
+    # =========================
+    def train(self):
+        rewards_history = []
+        episode = 0
 
-        state = env.reset()[0]      # Starting position, starting velocity always 0
-        state_p = np.digitize(state[0], pos_space)
-        state_v = np.digitize(state[1], vel_space)
-        state_a = np.digitize(state[2], ang_space)
-        state_av = np.digitize(state[3], ang_vel_space)
+        print("🚀 Training Started...")
 
-        terminated = False          # True when reached goal
+        while True:
+            state, _ = self.env.reset()
+            state_d = self._discretize(state)
 
-        rewards=0
+            total_reward = 0
+            done = False
 
-        while(not terminated and rewards < 10000):
+            while not done and total_reward < 10000:
 
-            if is_training and rng.random() < epsilon:
-                # Choose random action  (0=go left, 1=go right)
-                action = env.action_space.sample()
-            else:
-                action = np.argmax(q[state_p, state_v, state_a, state_av, :])
+                # Epsilon-greedy
+                if self.rng.random() < self.epsilon:
+                    action = self.env.action_space.sample()
+                else:
+                    action = np.argmax(self.q_table[state_d])
 
-            new_state,reward,terminated,_,_ = env.step(action)
-            new_state_p = np.digitize(new_state[0], pos_space)
-            new_state_v = np.digitize(new_state[1], vel_space)
-            new_state_a = np.digitize(new_state[2], ang_space)
-            new_state_av= np.digitize(new_state[3], ang_vel_space)
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
 
-            if is_training:
-                q[state_p, state_v, state_a, state_av, action] = q[state_p, state_v, state_a, state_av, action] + learning_rate_a * (
-                    reward + discount_factor_g*np.max(q[new_state_p, new_state_v, new_state_a, new_state_av,:]) - q[state_p, state_v, state_a, state_av, action]
+                next_state_d = self._discretize(next_state)
+
+                # Q-learning update
+                self.q_table[state_d][action] += self.alpha * (
+                    reward +
+                    self.gamma * np.max(self.q_table[next_state_d]) -
+                    self.q_table[state_d][action]
                 )
 
-            state = new_state
-            state_p = new_state_p
-            state_v = new_state_v
-            state_a = new_state_a
-            state_av= new_state_av
+                state_d = next_state_d
+                total_reward += reward
 
-            rewards+=reward
+            rewards_history.append(total_reward)
 
-            if not is_training and rewards%100==0:
-                print(f'Episode: {i}  Rewards: {rewards}')
+            # Logging
+            mean_reward = np.mean(rewards_history[-100:])
 
-        rewards_per_episode.append(rewards)
-        mean_rewards = np.mean(rewards_per_episode[len(rewards_per_episode)-100:])
+            if episode % 100 == 0:
+                print(f"Episode: {episode} | Reward: {total_reward:.0f} | Mean(100): {mean_reward:.1f} | Epsilon: {self.epsilon:.2f}")
 
-        if is_training and i%100==0:
-            print(f'Episode: {i} {rewards}  Epsilon: {epsilon:0.2f}  Mean Rewards {mean_rewards:0.1f}')
+            # Stop condition
+            if mean_reward > 1000:
+                print("✅ Environment Solved!")
+                break
 
-        if mean_rewards>1000:
-            break
+            # Decay epsilon
+            self.epsilon = max(self.epsilon - self.epsilon_decay, 0)
 
-        epsilon = max(epsilon - epsilon_decay_rate, 0)
+            episode += 1
 
-        i+=1
+        self.env.close()
+        self._save_model()
+        self._plot(rewards_history)
 
-    env.close()
+    # =========================
+    # Testing
+    # =========================
+    def test(self, episodes=5):
+        self._load_model()
 
-    # Save Q table to file
-    if is_training:
-        f = open('cartpole.pkl','wb')
-        pickle.dump(q, f)
-        f.close()
+        for ep in range(episodes):
+            state, _ = self.env.reset()
+            state_d = self._discretize(state)
 
-    mean_rewards = []
-    for t in range(i):
-        mean_rewards.append(np.mean(rewards_per_episode[max(0, t-100):(t+1)]))
-    plt.plot(mean_rewards)
-    plt.savefig(f'cartpole.png')
+            total_reward = 0
+            done = False
 
-if __name__ == '__main__':
-    # run(is_training=True, render=False)
+            while not done:
+                action = np.argmax(self.q_table[state_d])
+                state, reward, terminated, truncated, _ = self.env.step(action)
+                state_d = self._discretize(state)
+                done = terminated or truncated
+                total_reward += reward
 
-    run(is_training=False, render=True)
+            print(f"Test Episode {ep+1}: Reward = {total_reward}")
+
+        self.env.close()
+
+    # =========================
+    # Save / Load
+    # =========================
+    def _save_model(self):
+        with open("cartpole_q_table.pkl", "wb") as f:
+            pickle.dump(self.q_table, f)
+
+    def _load_model(self):
+        with open("cartpole_q_table.pkl", "rb") as f:
+            self.q_table = pickle.load(f)
+
+    # =========================
+    # Plotting
+    # =========================
+    def _plot(self, rewards):
+        moving_avg = [
+            np.mean(rewards[max(0, i-100):(i+1)])
+            for i in range(len(rewards))
+        ]
+
+        plt.plot(moving_avg)
+        plt.title("CartPole Q-Learning Performance")
+        plt.xlabel("Episodes")
+        plt.ylabel("Average Reward (Last 100)")
+        plt.savefig("cartpole_training.png")
+        plt.close()
+
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+
+    agent = CartPoleQLearning(render=False)
+
+    # Train
+    agent.train()
+
+    # Test
+    agent = CartPoleQLearning(render=True)
+    agent.test(episodes=3)

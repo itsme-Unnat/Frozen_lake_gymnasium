@@ -3,67 +3,116 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 
-def run(episodes, is_training=True, render=False):
 
-    env = gym.make('FrozenLake-v1', map_name="8x8", is_slippery=True, render_mode='human' if render else None)
+class FrozenLakeAgent:
+    def __init__(self, map_size="8x8", slippery=True):
+        self.env = gym.make(
+            "FrozenLake-v1",
+            map_name=map_size,
+            is_slippery=slippery
+        )
+        self.state_size = self.env.observation_space.n
+        self.action_size = self.env.action_space.n
 
-    if(is_training):
-        q = np.zeros((env.observation_space.n, env.action_space.n)) # init a 64 x 4 array
-    else:
-        f = open('frozen_lake8x8.pkl', 'rb')
-        q = pickle.load(f)
-        f.close()
+        # Initialize Q-table
+        self.q_table = np.zeros((self.state_size, self.action_size))
 
-    learning_rate_a = 0.9 # alpha or learning rate
-    discount_factor_g = 0.9 # gamma or discount rate. Near 0: more weight/reward placed on immediate state. Near 1: more on future state.
-    epsilon = 1         # 1 = 100% random actions
-    epsilon_decay_rate = 0.0001        # epsilon decay rate. 1/0.0001 = 10,000
-    rng = np.random.default_rng()   # random number generator
+    def train(self, episodes=10000, render=False):
+        if render:
+            self.env = gym.make(
+                "FrozenLake-v1",
+                map_name="8x8",
+                is_slippery=True,
+                render_mode="human"
+            )
 
-    rewards_per_episode = np.zeros(episodes)
+        alpha = 0.9       # Learning rate
+        gamma = 0.9       # Discount factor
+        epsilon = 1.0     # Exploration rate
+        decay = 0.0001
 
-    for i in range(episodes):
-        state = env.reset()[0]  # states: 0 to 63, 0=top left corner,63=bottom right corner
-        terminated = False      # True when fall in hole or reached goal
-        truncated = False       # True when actions > 200
+        rng = np.random.default_rng()
+        rewards = np.zeros(episodes)
 
-        while(not terminated and not truncated):
-            if is_training and rng.random() < epsilon:
-                action = env.action_space.sample() # actions: 0=left,1=down,2=right,3=up
-            else:
-                action = np.argmax(q[state,:])
+        for ep in range(episodes):
+            state = self.env.reset()[0]
+            done = False
 
-            new_state,reward,terminated,truncated,_ = env.step(action)
+            while not done:
+                # Epsilon-greedy policy
+                if rng.random() < epsilon:
+                    action = self.env.action_space.sample()
+                else:
+                    action = np.argmax(self.q_table[state])
 
-            if is_training:
-                q[state,action] = q[state,action] + learning_rate_a * (
-                    reward + discount_factor_g * np.max(q[new_state,:]) - q[state,action]
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
+
+                # Q-learning update
+                self.q_table[state, action] += alpha * (
+                    reward + gamma * np.max(self.q_table[next_state]) - self.q_table[state, action]
                 )
 
-            state = new_state
+                state = next_state
 
-        epsilon = max(epsilon - epsilon_decay_rate, 0)
+            # Decay epsilon
+            epsilon = max(epsilon - decay, 0)
 
-        if(epsilon==0):
-            learning_rate_a = 0.0001
+            # Reduce learning rate after exploration ends
+            if epsilon == 0:
+                alpha = 0.0001
 
-        if reward == 1:
-            rewards_per_episode[i] = 1
+            rewards[ep] = reward
 
-    env.close()
+        self.env.close()
+        self._save_model()
+        self._plot_rewards(rewards)
 
-    sum_rewards = np.zeros(episodes)
-    for t in range(episodes):
-        sum_rewards[t] = np.sum(rewards_per_episode[max(0, t-100):(t+1)])
-    plt.plot(sum_rewards)
-    plt.savefig('frozen_lake8x8.png')
+    def test(self, episodes=1000):
+        self._load_model()
 
-    if is_training:
-        f = open("frozen_lake8x8.pkl","wb")
-        pickle.dump(q, f)
-        f.close()
+        success_count = 0
 
-if __name__ == '__main__':
-    # run(15000)
+        for _ in range(episodes):
+            state = self.env.reset()[0]
+            done = False
 
-    run(1000, is_training=True, render=True)
+            while not done:
+                action = np.argmax(self.q_table[state])
+                state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
+
+            success_count += reward
+
+        print(f"Success Rate: {success_count / episodes * 100:.2f}%")
+
+    def _save_model(self):
+        with open("q_table.pkl", "wb") as f:
+            pickle.dump(self.q_table, f)
+
+    def _load_model(self):
+        with open("q_table.pkl", "rb") as f:
+            self.q_table = pickle.load(f)
+
+    def _plot_rewards(self, rewards):
+        moving_avg = np.zeros(len(rewards))
+
+        for i in range(len(rewards)):
+            moving_avg[i] = np.sum(rewards[max(0, i - 100):(i + 1)])
+
+        plt.plot(moving_avg)
+        plt.title("Training Performance (Moving Sum of Rewards)")
+        plt.xlabel("Episodes")
+        plt.ylabel("Reward (Last 100 Episodes)")
+        plt.savefig("training_plot.png")
+        plt.close()
+
+
+if __name__ == "__main__":
+    agent = FrozenLakeAgent()
+
+    # Train the agent
+    agent.train(episodes=1000, render=True)
+
+    # Test performance
+    agent.test(episodes=500)

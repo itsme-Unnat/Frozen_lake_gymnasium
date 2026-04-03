@@ -1,257 +1,360 @@
-import gymnasium as gym
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import deque
+"""
+Mountain Car — Deep Q-Learning (DQN) Solution
+===============================================
+Environment : MountainCar-v0  (Gymnasium)
+Algorithm   : Deep Q-Learning with Experience Replay & Target Network
+Author      : Your Name
+Date        : 2026
+
+Description
+-----------
+A Deep Q-Learning agent that learns to drive an underpowered car up a steep
+hill. Two neural networks are used:
+  - Policy DQN  : updated every step via gradient descent
+  - Target DQN  : a frozen copy of the policy network, synced periodically
+                  to stabilise training
+
+The continuous (position, velocity) observation is discretised into 20 bins
+per dimension before being fed into the networks.
+
+Observation Space
+-----------------
+  position : -1.2  →  0.6   (goal ≥ 0.45)
+  velocity : -0.07 →  0.07
+
+Action Space
+------------
+  0 → push left
+  1 → no push (neutral)
+  2 → push right
+"""
+
 import random
+from collections import deque
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
-# Define model
+
+# ---------------------------------------------------------------------------
+# Neural Network — Deep Q-Network
+# ---------------------------------------------------------------------------
 class DQN(nn.Module):
-    def __init__(self, in_states, h1_nodes, out_actions):
+    """
+    A simple two-layer fully-connected Q-Network.
+
+    Parameters
+    ----------
+    in_states   : Number of input features (observation dimensions).
+    h1_nodes    : Number of hidden-layer neurons.
+    out_actions : Number of output Q-values (one per action).
+    """
+
+    def __init__(self, in_states: int, h1_nodes: int, out_actions: int):
         super().__init__()
+        self.fc1 = nn.Linear(in_states, h1_nodes)    # hidden layer
+        self.out = nn.Linear(h1_nodes, out_actions)  # output layer
 
-        # Define network layers
-        self.fc1 = nn.Linear(in_states, h1_nodes)   # first fully connected layer
-        self.out = nn.Linear(h1_nodes, out_actions) # ouptut layer w
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x))  # ReLU activation on hidden layer
+        return self.out(x)       # raw Q-values (no activation on output)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x)) # Apply rectified linear unit (ReLU) activation
-        x = self.out(x)         # Calculate output
-        return x
 
-# Define memory for Experience Replay
-class ReplayMemory():
-    def __init__(self, maxlen):
-        self.memory = deque([], maxlen=maxlen)
+# ---------------------------------------------------------------------------
+# Experience Replay Memory
+# ---------------------------------------------------------------------------
+class ReplayMemory:
+    """
+    Circular buffer that stores (state, action, next_state, reward, done)
+    transitions and supports uniform random sampling for mini-batch training.
+    """
 
-    def append(self, transition):
+    def __init__(self, capacity: int):
+        self.memory = deque([], maxlen=capacity)
+
+    def push(self, transition: tuple):
+        """Store a single transition."""
         self.memory.append(transition)
 
-    def sample(self, sample_size):
-        return random.sample(self.memory, sample_size)
+    def sample(self, batch_size: int) -> list:
+        """Return a random batch of transitions."""
+        return random.sample(self.memory, batch_size)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.memory)
 
-# MountainCar Deep Q-Learning
-class MountainCarDQL():
-    # Hyperparameters (adjustable)
-    learning_rate_a = 0.01         # learning rate (alpha)
-    discount_factor_g = 0.9         # discount rate (gamma)    
-    network_sync_rate = 50000          # number of steps the agent takes before syncing the policy and target network
-    replay_memory_size = 100000       # size of replay memory
-    mini_batch_size = 32            # size of the training data set sampled from the replay memory
-    
-    num_divisions = 20
 
-    # Neural Network
-    loss_fn = nn.MSELoss()          # NN Loss function. MSE=Mean Squared Error can be swapped to something else.
-    optimizer = None                # NN Optimizer. Initialize later.
+# ---------------------------------------------------------------------------
+# Deep Q-Learning Agent
+# ---------------------------------------------------------------------------
+class MountainCarDQL:
+    """
+    Deep Q-Learning agent for MountainCar-v0.
 
+    Hyperparameters
+    ---------------
+    All class-level constants can be tuned without touching the training logic.
+    """
 
-    # Train the environment
-    def train(self, episodes, render=False):
-        # Create FrozenLake instance
-        env = gym.make('MountainCar-v0', render_mode='human' if render else None)
-        num_states = env.observation_space.shape[0] # expecting 2: position & velocity
-        num_actions = env.action_space.n
+    # ── Hyperparameters ─────────────────────────────────────────────────────
+    LEARNING_RATE      = 0.01     # Adam optimiser learning rate (α)
+    DISCOUNT_FACTOR    = 0.9      # Future-reward discount (γ)
+    NETWORK_SYNC_STEPS = 50_000   # Steps between policy → target network sync
+    REPLAY_MEMORY_SIZE = 100_000  # Maximum transitions stored in replay buffer
+    MINI_BATCH_SIZE    = 32       # Transitions sampled per optimisation step
+    NUM_BINS           = 20       # Discretisation bins per observation dimension
+    MODEL_SAVE_PREFIX  = "mountaincar_dql"
 
-        # Divide position and velocity into segments
-        self.pos_space = np.linspace(env.observation_space.low[0], env.observation_space.high[0], self.num_divisions)    # Between -1.2 and 0.6
-        self.vel_space = np.linspace(env.observation_space.low[1], env.observation_space.high[1], self.num_divisions)    # Between -0.07 and 0.07
-    
-        epsilon = 1 # 1 = 100% random actions
-        memory = ReplayMemory(self.replay_memory_size)
+    # ── Loss & optimiser (initialised in train) ──────────────────────────────
+    loss_fn   = nn.MSELoss()
+    optimizer = None
 
-        # Create policy and target network. Number of nodes in the hidden layer can be adjusted.
-        policy_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions)
-        target_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions)
+    # ── Observation bin edges (set in train / test) ──────────────────────────
+    pos_space = None
+    vel_space = None
 
-        # Make the target and policy networks the same (copy weights/biases from one network to the other)
-        target_dqn.load_state_dict(policy_dqn.state_dict())
-        
-        # Policy network optimizer. "Adam" optimizer can be swapped to something else. 
-        self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+    def _build_spaces(self, env: gym.Env):
+        """Construct discretised bin edges from the environment's obs limits."""
+        self.pos_space = np.linspace(
+            env.observation_space.low[0],
+            env.observation_space.high[0],
+            self.NUM_BINS,
+        )
+        self.vel_space = np.linspace(
+            env.observation_space.low[1],
+            env.observation_space.high[1],
+            self.NUM_BINS,
+        )
 
-        # List to keep track of rewards collected per episode. Initialize list to 0's.
-        rewards_per_episode = []
+    def state_to_tensor(self, state) -> torch.Tensor:
+        """
+        Discretise a continuous (position, velocity) state and return it as a
+        FloatTensor suitable for the DQN.
 
-        # List to keep track of epsilon decay
-        epsilon_history = []
+        Example
+        -------
+        Input  → (0.3, -0.03)
+        Output → tensor([16., 6.])
+        """
+        pos_idx = np.digitize(state[0], self.pos_space)
+        vel_idx = np.digitize(state[1], self.vel_space)
+        return torch.FloatTensor([pos_idx, vel_idx])
 
-        # Track number of steps taken. Used for syncing policy => target network.
-        step_count=0
-        goal_reached=False
-        best_rewards=-200
-            
-        for i in range(episodes):
-            state = env.reset()[0]  # Initialize to state 0
-            terminated = False      # True when agent falls in hole or reached goal
-
-            rewards = 0
-
-            # Agent navigates map until it falls into hole/reaches goal (terminated), or has taken 200 actions (truncated).
-            while(not terminated and rewards>-1000):
-
-                # Select action based on epsilon-greedy
-                if random.random() < epsilon:
-                    # select random action
-                    action = env.action_space.sample() # actions: 0=left,1=idle,2=right
-                else:
-                    # select best action            
-                    with torch.no_grad():
-                        action = policy_dqn(self.state_to_dqn_input(state)).argmax().item()
-
-                # Execute action
-                new_state,reward,terminated,truncated,_ = env.step(action)
-
-                # Accumulate reward
-                rewards += reward
-
-                # Save experience into memory
-                memory.append((state, action, new_state, reward, terminated)) 
-
-                # Move to the next state
-                state = new_state
-
-                # Increment step counter
-                step_count+=1
-
-            # Keep track of the rewards collected per episode.
-            rewards_per_episode.append(rewards)
-            if(terminated):
-                goal_reached = True
-
-            # Graph training progress
-            if(i!=0 and i%1000==0):
-                print(f'Episode {i} Epsilon {epsilon}')
-                                        
-                self.plot_progress(rewards_per_episode, epsilon_history)
-            
-            if rewards>best_rewards:
-                best_rewards = rewards
-                print(f'Best rewards so far: {best_rewards}')
-                # Save policy
-                torch.save(policy_dqn.state_dict(), f"mountaincar_dql_{i}.pt")
-
-            # Check if enough experience has been collected
-            if len(memory)>self.mini_batch_size and goal_reached:
-                mini_batch = memory.sample(self.mini_batch_size)
-                self.optimize(mini_batch, policy_dqn, target_dqn)        
-
-                # Decay epsilon
-                epsilon = max(epsilon - 1/episodes, 0)
-                epsilon_history.append(epsilon)
-
-                # Copy policy network to target network after a certain number of steps
-                if step_count > self.network_sync_rate:
-                    target_dqn.load_state_dict(policy_dqn.state_dict())
-                    step_count=0                    
-
-        # Close environment
-        env.close()
-    def plot_progress(self, rewards_per_episode, epsilon_history):
-        # Create new graph 
-        plt.figure(1)
-
-        # Plot average rewards (Y-axis) vs episodes (X-axis)
-        # rewards_curve = np.zeros(len(rewards_per_episode))
-        # for x in range(len(rewards_per_episode)):
-            # rewards_curve[x] = np.min(rewards_per_episode[max(0, x-10):(x+1)])
-        plt.subplot(121) # plot on a 1 row x 2 col grid, at cell 1
-        # plt.plot(sum_rewards)
-        plt.plot(rewards_per_episode)
-        
-        # Plot epsilon decay (Y-axis) vs episodes (X-axis)
-        plt.subplot(122) # plot on a 1 row x 2 col grid, at cell 2
-        plt.plot(epsilon_history)
-        
-        # Save plots
-        plt.savefig('mountaincar_dql.png')
-    # Optimize policy network
-    def optimize(self, mini_batch, policy_dqn, target_dqn):
-
+    # -----------------------------------------------------------------------
+    # Optimisation step (mini-batch Bellman update)
+    # -----------------------------------------------------------------------
+    def _optimise(self, mini_batch: list, policy_dqn: DQN, target_dqn: DQN):
+        """
+        Perform one gradient-descent step on the policy network using a
+        mini-batch of stored transitions.
+        """
         current_q_list = []
-        target_q_list = []
+        target_q_list  = []
 
-        for state, action, new_state, reward, terminated in mini_batch:
+        for state, action, next_state, reward, terminated in mini_batch:
 
-            if terminated: 
-                # Agent receive reward of 0 for reaching goal.
-                # When in a terminated state, target q value should be set to the reward.
+            if terminated:
+                # Terminal state: target is just the immediate reward
                 target = torch.FloatTensor([reward])
             else:
-                # Calculate target q value 
+                # Bellman equation: r + γ * max Q(s', a'; θ⁻)
                 with torch.no_grad():
-                    target = torch.FloatTensor(
-                        reward + self.discount_factor_g * target_dqn(self.state_to_dqn_input(new_state)).max()
-                    )
+                    best_next_q = target_dqn(self.state_to_tensor(next_state)).max()
+                    target = torch.FloatTensor([reward + self.DISCOUNT_FACTOR * best_next_q])
 
-            # Get the current set of Q values
-            current_q = policy_dqn(self.state_to_dqn_input(state))
+            # Current Q-values from policy network
+            current_q = policy_dqn(self.state_to_tensor(state))
             current_q_list.append(current_q)
 
-            # Get the target set of Q values
-            target_q = target_dqn(self.state_to_dqn_input(state)) 
-            # Adjust the specific action to the target that was just calculated
+            # Build target Q-vector (only update the taken action)
+            target_q = target_dqn(self.state_to_tensor(state)).detach().clone()
             target_q[action] = target
             target_q_list.append(target_q)
-                
-        # Compute loss for the whole minibatch
-        loss = self.loss_fn(torch.stack(current_q_list), torch.stack(target_q_list))
 
-        # Optimize the model
+        # Compute MSE loss and backpropagate
+        loss = self.loss_fn(torch.stack(current_q_list), torch.stack(target_q_list))
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-    '''
-    Converts a state (position, velocity) to tensor representation.
-    Example:
-    Input = (0.3, -0.03)
-    Return = tensor([16, 6])
-    '''
-    def state_to_dqn_input(self, state)->torch.Tensor:
-        state_p = np.digitize(state[0], self.pos_space)
-        state_v = np.digitize(state[1], self.vel_space)
-        
-        return torch.FloatTensor([state_p, state_v])
-    
-    # Run the environment with the learned policy
-    def test(self, episodes, model_filepath):
-        # Create FrozenLake instance
-        env = gym.make('MountainCar-v0', render_mode='human')
-        num_states = env.observation_space.shape[0]
+    # -----------------------------------------------------------------------
+    # Training progress plot
+    # -----------------------------------------------------------------------
+    def _plot_progress(self, rewards_per_episode: list, epsilon_history: list):
+        """Save a two-panel training-progress figure to disk."""
+        plt.figure(1, figsize=(12, 5))
+        plt.clf()
+
+        # Panel 1 — reward per episode
+        plt.subplot(1, 2, 1)
+        plt.plot(rewards_per_episode, color="steelblue", linewidth=0.8)
+        plt.xlabel("Episode")
+        plt.ylabel("Total Reward")
+        plt.title("Reward per Episode")
+
+        # Panel 2 — epsilon decay
+        plt.subplot(1, 2, 2)
+        plt.plot(epsilon_history, color="darkorange", linewidth=1.2)
+        plt.xlabel("Episode")
+        plt.ylabel("Epsilon")
+        plt.title("Epsilon Decay")
+
+        plt.tight_layout()
+        plt.savefig(f"{self.MODEL_SAVE_PREFIX}.png")
+        print(f"Training plot saved → {self.MODEL_SAVE_PREFIX}.png")
+
+    # -----------------------------------------------------------------------
+    # Public: train
+    # -----------------------------------------------------------------------
+    def train(self, episodes: int, render: bool = False):
+        """
+        Train the DQN agent on MountainCar-v0.
+
+        Parameters
+        ----------
+        episodes : Total number of training episodes.
+        render   : If True, open the visual environment window.
+        """
+        env = gym.make("MountainCar-v0", render_mode="human" if render else None)
+        num_states  = env.observation_space.shape[0]   # 2: position & velocity
+        num_actions = env.action_space.n               # 3: left / neutral / right
+
+        self._build_spaces(env)
+
+        # ── Networks ────────────────────────────────────────────────────────
+        policy_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions)
+        target_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions)
+        target_dqn.load_state_dict(policy_dqn.state_dict())  # start in sync
+
+        self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.LEARNING_RATE)
+
+        # ── Replay buffer & tracking ─────────────────────────────────────────
+        memory             = ReplayMemory(self.REPLAY_MEMORY_SIZE)
+        rewards_per_episode: list = []
+        epsilon_history:     list = []
+
+        epsilon      = 1.0                      # start fully random
+        step_count   = 0
+        goal_reached = False
+        best_reward  = -200.0
+
+        print(f"Starting training for {episodes} episodes …\n")
+
+        # ── Episode loop ─────────────────────────────────────────────────────
+        for episode in range(episodes):
+            state      = env.reset()[0]
+            terminated = False
+            total_reward = 0.0
+
+            while not terminated and total_reward > -1_000:
+
+                # ε-greedy action selection
+                if random.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        action = policy_dqn(self.state_to_tensor(state)).argmax().item()
+
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                total_reward += reward
+
+                memory.push((state, action, next_state, reward, terminated))
+                state       = next_state
+                step_count += 1
+
+            rewards_per_episode.append(total_reward)
+
+            if terminated:
+                goal_reached = True
+
+            # Save best model checkpoint
+            if total_reward > best_reward:
+                best_reward = total_reward
+                save_path   = f"{self.MODEL_SAVE_PREFIX}_{episode}.pt"
+                torch.save(policy_dqn.state_dict(), save_path)
+                print(f"  ★  New best reward {best_reward:.1f} at episode {episode} → {save_path}")
+
+            # Periodic progress report & plot
+            if episode != 0 and episode % 1_000 == 0:
+                print(f"  Episode {episode:>6} / {episodes}  |  ε = {epsilon:.4f}")
+                self._plot_progress(rewards_per_episode, epsilon_history)
+
+            # Optimise once enough experience is available and goal seen once
+            if len(memory) > self.MINI_BATCH_SIZE and goal_reached:
+                mini_batch = memory.sample(self.MINI_BATCH_SIZE)
+                self._optimise(mini_batch, policy_dqn, target_dqn)
+
+                # Decay epsilon
+                epsilon = max(epsilon - 1.0 / episodes, 0.0)
+                epsilon_history.append(epsilon)
+
+                # Sync target network periodically
+                if step_count >= self.NETWORK_SYNC_STEPS:
+                    target_dqn.load_state_dict(policy_dqn.state_dict())
+                    step_count = 0
+                    print(f"  ↻  Target network synced at episode {episode}")
+
+        env.close()
+        self._plot_progress(rewards_per_episode, epsilon_history)
+        print("\nTraining complete.")
+
+    # -----------------------------------------------------------------------
+    # Public: test
+    # -----------------------------------------------------------------------
+    def test(self, episodes: int, model_filepath: str):
+        """
+        Evaluate a trained policy on MountainCar-v0 with rendering.
+
+        Parameters
+        ----------
+        episodes       : Number of evaluation episodes to run.
+        model_filepath : Path to a saved policy-network .pt file.
+        """
+        env = gym.make("MountainCar-v0", render_mode="human")
+        num_states  = env.observation_space.shape[0]
         num_actions = env.action_space.n
 
-        self.pos_space = np.linspace(env.observation_space.low[0], env.observation_space.high[0], self.num_divisions)    # Between -1.2 and 0.6
-        self.vel_space = np.linspace(env.observation_space.low[1], env.observation_space.high[1], self.num_divisions)    # Between -0.07 and 0.07
+        self._build_spaces(env)
 
-        # Load learned policy
-        policy_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions) 
+        # Load saved policy weights
+        policy_dqn = DQN(in_states=num_states, h1_nodes=10, out_actions=num_actions)
         policy_dqn.load_state_dict(torch.load(model_filepath))
-        policy_dqn.eval()    # switch model to evaluation mode
+        policy_dqn.eval()
+        print(f"Loaded model from '{model_filepath}'")
 
-        for i in range(episodes):
-            state = env.reset()[0]  # Initialize to state 0
-            terminated = False      # True when agent falls in hole or reached goal
-            truncated = False       # True when agent takes more than 200 actions            
+        for episode in range(episodes):
+            state      = env.reset()[0]
+            terminated = False
+            truncated  = False
+            total_reward = 0.0
 
-            # Agent navigates map until it falls into a hole (terminated), reaches goal (terminated), or has taken 200 actions (truncated).
-            while(not terminated and not truncated):  
-                # Select best action   
+            while not terminated and not truncated:
                 with torch.no_grad():
-                    action = policy_dqn(self.state_to_dqn_input(state)).argmax().item()
+                    action = policy_dqn(self.state_to_tensor(state)).argmax().item()
 
-                # Execute action
-                state,reward,terminated,truncated,_ = env.step(action)
+                state, reward, terminated, truncated, _ = env.step(action)
+                total_reward += reward
+
+            print(f"  Episode {episode + 1:>3} / {episodes}  |  reward: {total_reward:.1f}")
 
         env.close()
 
-if __name__ == '__main__':
 
-    mountaincar = MountainCarDQL()
-    # mountaincar.train(20000, False)
-    mountaincar.test(10, "mountaincar_dql_17000.pt")
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    agent = MountainCarDQL()
+
+    # ── Train (uncomment to run) ─────────────────────────────────────────────
+    # agent.train(episodes=20_000, render=False)
+
+    # ── Evaluate a saved model ───────────────────────────────────────────────
+    agent.test(episodes=10, model_filepath="mountaincar_dql_17000.pt")
